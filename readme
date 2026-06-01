@@ -1,0 +1,332 @@
+GraphQL Stepping Stones & Lessons Learned
+1. Two Builder Systems — The Big Gotcha
+Problem: CloudCart has TWO separate page builder systems:
+
+Grid Builder (admin UI): What actually renders on the storefront. Uses _grid-row, _grid-section CSS classes. Managed through the admin panel's visual editor.
+Page Builder API (builderDesign, savePageBuilderDesign, publishPageBuilderDesign): Stores designs via GraphQL but does NOT control what renders on the homepage.
+What we tried:
+
+updatePage(id, input: { builderDesign: design, publishDesign: true }) — saves successfully, increments publishedHistoryId, but nothing changes on the page
+publishPageBuilderDesign(pageId, design) — same, stores the design but doesn't affect rendering
+savePageBuilderDesign(pageId, input: { design, publish: true }) — same result
+pageBuilderDesign(pageId) query confirms our design is stored correctly
+All history versions show published: true with our design, but the page renders completely different content from the grid builder
+Available widget types (all valid for map field): title, text, code, button, separator, video, banner, carousel, text-carousel, product-showcase, showcase, product, add-to-cart, bundle-products, recent-articles, order-details, product_review, request_review, store_locations, cc_form
+
+The code widget accepts up to 3M chars of HTML/JS, enabled: true setting — it IS a real widget, just not rendered because the grid builder takes priority.
+
+Solution: Use customCssJs JavaScript injection for all visual customizations (footer, banners, logo, scroll effects). This is the same field used for CSS overrides and it reliably executes on page load.
+
+2. Footer Navigation — Theme Template Limitation
+Problem: Created footer navigation with group, snippet, and child items via the navigation API. The API accepted everything correctly, but the theme template (_footer-variant-two) only renders flat navigation links — it completely ignores group type items, snippet type items with widgetText, and parent-child relationships.
+
+What we tried:
+
+snippet type with widgetText field containing HTML — accepted by API, ignored by theme
+group type with children (categories, pages) — accepted by API, ignored by theme
+Various navigation types tested: widget, html, code, text, custom, heading, label — all invalid
+Valid types are only: page, category, url, product, article, group, section, snippet
+Solution: Inject the entire footer via JavaScript in customCssJs. Hide the default ._navigation-footer with CSS, create a .owllee-footer grid via JS DOM manipulation.
+
+3. Field Name Mismatches
+CloudCart's GraphQL schema uses inconsistent naming. Every one of these cost a retry cycle:
+
+Expected	Actual	Type
+title	name	Page, NavigationItem
+position	order	NavigationItem
+urlHandle	url_handle	Page, Category
+navigationItems	items	NavigationGroup
+navigation(id: $id)	navigation(group: $g)	Query (group is String, not ID)
+4. Return Type Surprises
+deleteNavigationItem returns Boolean, not an object — cannot use sub-selection { id }
+savePageBuilderDesign returns PageHistoryVersion, not Page — different fields available
+publishPageBuilderDesign returns Page! — requires sub-selection
+reorderNavigationItem returns Boolean
+5. Theme Variables API Quirks
+Input type is UpdateThemeVariablesInput (plural, not UpdateThemeVariableInput)
+Each variable uses parameter and value fields (not name/value)
+The mutation sometimes returns internal server error even when the variables are valid
+Footer colors are controlled BOTH by theme variables AND customCssJs !important overrides
+6. Product Options API Bug
+The entire new product options API (createProductOption, updateProductOption, deleteProductOption, productOption, productOptions) returns "Product Option app is not installed" even when application(name: "product_options").is_installed returns true.
+
+Only legacy mutations work: saveProductOption and toggleProductOptionStatus. But saveProductOption doesn't have mapping/mappedItemIds fields, so you can't assign options to specific products via the API.
+
+Full report: PRODUCT_OPTIONS_BUG_REPORT.md
+
+7. Social Links — No API
+Social media links (Facebook, Instagram, etc.) are NOT available in the GraphQL API at all. No type in the entire schema has social media fields. Must be configured manually in admin Settings > Social links. We injected them in the footer via JavaScript.
+
+8. Logo/Branding Upload — No API
+There is no GraphQL mutation for uploading a logo or managing branding settings. Logo must be uploaded manually in admin Branding settings. We replace the logo image src attribute via JavaScript using the CDN URL after manual upload.
+
+9. Code Widget Sanitization
+The page builder's code widget strips inline JavaScript event handlers (onmouseover, onmouseout, onclick). This can silently break HTML content without any error. Always use CSS for hover/interaction effects instead of inline JS handlers.
+
+10. Line Ending Issues (Windows)
+The customCssJs content stored in CloudCart uses \r\n (Windows line endings). String replacement operations using \n will fail silently. Always account for \r\n when doing find-and-replace on customCssJs content.
+
+11. Rate Limiting
+The GraphQL API has rate limits. Our cc_graphql.py helper implements batching: 45 calls per batch with a 62-second pause between batches. The gql() function also has retry logic (3 retries) for transient errors.
+
+12. customCssJs — The Universal Escape Hatch
+When all else fails, customCssJs via updateCustomCssJs(content: String!) is the most reliable way to customize a CloudCart store. It supports:
+
+CSS rules with !important overrides
+<style> blocks
+<script> blocks with full DOM manipulation
+Runs on every page load (header, footer, all pages)
+Used for: footer injection, topbar text, logo replacement, promo banners, sticky header, scroll effects, copyright, hiding default elements
+SIZE LIMIT (~65K chars): Embedding 36.5KB of Three.js mesh data pushed customCssJs to ~91K chars, which silently truncated the <script> block and broke the entire site (blank white page). Keep total content well under 65K.
+Multiple <script> tags: customCssJs supports multiple independent <script> blocks. Use separate tags for independent features to avoid coupling.
+13. CloudCart File Manager — Allowed Types
+The CloudCart file manager accepts: .js, .json, .png, .jpg, .svg, .mp4, .css, .webp, and more. It does NOT accept: .glb, .gltf (3D model formats). Uploaded files get CDN URLs at cdncloudcart.com/{store_id}/files/...
+
+ """
+Step 9: Apply owllee.com color palette to CloudCart theme via custom CSS.
+
+The updateThemeVariables GraphQL mutation updates DB values but returns
+Internal Server Error and doesn't regenerate the CDN-cached CSS.
+So we inject CSS overrides via updateCustomCssJs with !important rules.
+
+Owllee.com palette:
+  - Accent/highlight: #cc9c6b (golden/amber)
+  - Accent hover (10% darker): #b88c60
+  - Topbar background: #252322 (dark brown)
+"""
+
+import json
+import os
+import re
+import sys
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+from config import DATA_DIR
+from cc_graphql import gql
+
+
+ACCENT = "#cc9c6b"
+ACCENT_HOVER = "#b88c60"
+TOPBAR_BG = "#252322"
+
+
+def build_overrides_css():
+    """Build comprehensive CSS overrides for all CloudCart accent-colored elements."""
+    A = ACCENT
+    AH = ACCENT_HOVER
+    TB = TOPBAR_BG
+
+    return f"""
+/* === Owllee Brand Colors === */
+
+/* CRITICAL: Layout backgrounds (header, footer, topbar, navbar) */
+div._footer, div._footer-variant-one, div._footer-variant-two {{ background-color: #fcfbfa !important; color: #39352d !important; }}
+div._footer-bottom, div._footer-bottom-bar, div._footer-legal {{ background-color: #fcfbfa !important; }}
+._footer-cols, ._footer-utilities, ._footer-socials {{ background-color: #fcfbfa !important; }}
+._footer *, ._footer-legal * {{ color: #39352d !important; }}
+._header, ._header-inner, ._header-variant-one, ._header-variant-two, ._header-variant-three, ._header-variant-four {{ background-color: #ffffff !important; }}
+._navbar, ._navbar._type-megamenu, ._navbar._type-megamenu-two, ._navbar._type-dropdown {{ background-color: #ffffff !important; }}
+._navigation, ._navigation-wrapper {{ background-color: #ffffff !important; }}
+._search-form-container {{ background-color: #ffffff !important; }}
+._topbar, ._topbar-variant-one, ._topbar-variant-two {{ background-color: {TB} !important; border-color: {TB} !important; }}
+
+/* Links */
+a {{ color: {A} !important; }}
+a:hover {{ color: {AH} !important; }}
+
+/* Primary buttons */
+._button {{ background-color: {A} !important; border-color: {A} !important; }}
+._button:hover {{ background-color: {AH} !important; border-color: {AH} !important; }}
+._button.loading {{ color: {A} !important; }}
+
+/* Secondary buttons */
+._button-secondary {{ border-color: {A} !important; color: {A} !important; }}
+._button-secondary:hover {{ background-color: {A} !important; border-color: {A} !important; color: #fff !important; }}
+._button-secondary:active, ._button-secondary:focus {{ color: {A} !important; }}
+._button-secondary .loader-dots span {{ background-color: {A} !important; }}
+
+/* Ghost buttons */
+._button-small-ghost {{ border-color: {A} !important; color: {A} !important; }}
+._button-small-ghost:hover {{ background-color: {A} !important; border-color: {A} !important; }}
+
+/* Forms */
+._field:focus {{ border-color: {A} !important; }}
+._textarea:focus {{ border-color: {A} !important; }}
+._checkbox .checker span {{ color: {A} !important; }}
+._radio .radio span:before {{ background-color: {A} !important; }}
+._range-slider .ui-slider-range {{ background-color: {A} !important; }}
+._select.select2-allowclear .select2-choice abbr {{ color: {A} !important; }}
+.select2-results .select2-result.select2-highlighted {{ background-color: {A} !important; }}
+.input-group .input-group-btn .btn {{ background-color: {A} !important; }}
+
+/* Loader */
+.loader span {{ background-color: {A} !important; }}
+
+/* Navigation */
+._navigation-main-list-item.active > a, ._type-megamenu ._navigation .active > a {{ color: {A} !important; }}
+._navigation-dropdown-list-item > a:focus {{ color: {A} !important; }}
+._type-dropdown ._navigation-main-list-item:hover > a:focus {{ color: {A} !important; }}
+._type-megamenu ._navigation-dropdown a:hover:focus {{ color: {A} !important; }}
+._type-megamenu-two ._navigation > ul > li.active {{ color: {A} !important; }}
+._type-megamenu-two ._navigation > ul > li ul li ._figure-stack:hover {{ color: {A} !important; }}
+._nav-mobile-categories ._filter-categories-list .active > a {{ color: {A} !important; }}
+._navigation-footer-list-item-link:before {{ border-color: {A} !important; }}
+
+/* Header accents */
+._meta-links ._button-register {{ color: {A} !important; }}
+._bubble {{ background-color: {A} !important; }}
+
+/* Section titles */
+._section-title:before {{ border-color: {A} !important; }}
+._footer-title:before {{ border-color: {A} !important; }}
+._footer-boxes ._text h6:before {{ border-color: {A} !important; }}
+._showcase-product-title:before, ._showcase-title:before {{ border-color: {A} !important; }}
+._grid-section ._text ._text-title:before {{ border-color: {A} !important; }}
+
+/* Footer accents */
+._footer a {{ color: #39352d !important; }}
+._footer a:hover {{ color: {A} !important; }}
+._footer-boxes ._newsletter ._button {{ color: {A} !important; }}
+._to-top {{ border-color: {A} !important; color: {A} !important; }}
+._newsletter-form ._button {{ color: {A} !important; }}
+
+/* Sidebar & filters */
+._filters-one ._sidebar-box-title:before {{ border-color: {A} !important; }}
+._filters-one ._sidebar-list .active > a {{ color: {A} !important; }}
+._filters-two ._sidebar-box-title:before {{ border-color: {A} !important; }}
+._filters-two ._sidebar-list .active > a {{ color: {A} !important; }}
+._filters-two ._filter-type ._button:hover, ._filters-two ._filter-type ._button-active {{ color: {A} !important; }}
+._sidebar ._navigation-links .active > a {{ color: {A} !important; }}
+._sidebar-box ._button, ._cart-summary ._button, ._product-details-parameters ._button, ._product-details-sticky ._button {{ background-color: {A} !important; border-color: {A} !important; }}
+._sidebar-box ._button:hover, ._cart-summary ._button:hover, ._product-details-parameters ._button:hover {{ background-color: {AH} !important; border-color: {AH} !important; }}
+
+/* Products */
+body ._products-list .input-group .input-group-btn .btn {{ background-color: {A} !important; }}
+._product-ribbon-sale, ._product-details-ribbon-sale {{ background-color: {A} !important; }}
+._product-ribbon-delivery, ._product-details-ribbon-delivery {{ background-color: {A} !important; }}
+._product-discount, ._product-details-discount {{ color: {A} !important; }}
+._product-compare.active .fa, ._product-add-to-favorite.active .fa {{ color: {A} !important; }}
+._product-compare .checker span.checked {{ color: {A} !important; }}
+
+/* Product details */
+._product-details-gallery ul li.cc-active a:before {{ border-color: {A} !important; }}
+._product-details-countdown ._countdown-icon {{ color: {A} !important; }}
+._product-details-parameters-out-of-stock {{ color: {A} !important; }}
+._parameter-radio-value ._radio.active {{ border-color: {A} !important; }}
+._parameter-image-value.active {{ border-color: {A} !important; }}
+._parameter-color-value.active ._radio {{ border-color: {A} !important; }}
+._parameter-table-value ._radio.active {{ background-color: {A} !important; }}
+._product-details-tabs-nav-link.active {{ border-color: {A} !important; color: {A} !important; }}
+._product-details-share.open ._button-share, ._product-details-wishlist-button.active {{ border-color: {A} !important; color: {A} !important; }}
+._product-details-sticky-info ._product-details-price-new {{ color: {A} !important; }}
+
+/* Product lists, slider, carousel, breadcrumbs, pagination */
+._list-one ._product-quick-view, ._list-horizontal ._product-quick-view {{ background-color: {A} !important; border-color: {A} !important; }}
+.slide-html h1, .slide-html h2, .slide-html h3 {{ color: {A} !important; }}
+.slide-html ._button {{ background-color: {A} !important; border-color: {A} !important; }}
+.swiper-pagination-bullet.swiper-pagination-bullet-active {{ background-color: {A} !important; }}
+._carousel-button {{ background-color: {A} !important; border-color: {A} !important; }}
+.pagination li.active a {{ color: {A} !important; }}
+.modal-content ._button {{ background-color: {A} !important; border-color: {A} !important; }}
+._promo-bar-container {{ background-color: {A} !important; }}
+._cart-compact-products ._button, ._wishlist-compact-products ._button {{ border-color: {A} !important; color: {A} !important; }}
+._checkout-shipping-providers-controls ._radio.active {{ background-color: {A} !important; }}
+._compare-box-toggle {{ color: {A} !important; }}
+
+/* Scope the generic "a" rule to avoid coloring text-links that should stay dark */
+._header a {{ color: #39352d !important; }}
+._header a:hover {{ color: {A} !important; }}
+._footer a {{ color: #39352d !important; }}
+._footer a:hover {{ color: {A} !important; }}
+._navigation a {{ color: #39352d !important; }}
+._navigation a:hover, ._navigation .active > a {{ color: {A} !important; }}
+._topbar a {{ color: #ffffff !important; }}
+._topbar a:hover {{ color: {A} !important; }}
+._product-listing-title a {{ color: #39352d !important; }}
+._product-listing-title a:hover {{ color: {A} !important; }}
+._breadcrumb a {{ color: #666666 !important; }}
+._breadcrumb a:hover {{ color: {A} !important; }}
+._product-details-leasing-button a {{ background-color: {A} !important; border-color: {A} !important; }}
+._product-details-leasing-button a:hover {{ background-color: {AH} !important; border-color: {AH} !important; }}
+/* Ensure main body text isn't turned to accent color */
+body {{ color: #39352d !important; }}
+p, li, td, th, span {{ color: inherit; }}
+"""
+
+
+def main():
+    print("=== Step 9: Apply Owllee.com Theme Colors ===\n")
+    print(f"  Accent: {ACCENT}")
+    print(f"  Hover:  {ACCENT_HOVER}")
+    print(f"  Topbar: {TOPBAR_BG}\n")
+
+    # 1. Build override CSS
+    override_css = build_overrides_css()
+    print(f"Override CSS: {len(override_css)} chars\n")
+
+    # 2. Get existing custom CSS
+    result = gql('query { customCssJs }')
+    existing = result.get('data', {}).get('customCssJs', '')
+    print(f"Existing custom CSS: {len(existing)} chars")
+
+    # 3. Build clean single <style> tag — no leftover from previous runs.
+    # CloudCart renders ~10K per style tag. Put critical layout first.
+    # Banner-caption CSS is small (~575 chars), keep it.
+    banner_css = """._banner-caption {
+    font-weight: 700;
+    background-color: #ffffffe0;
+    width: 40%;
+    bottom: 44%;
+    left: 30%;
+    font-size: 20px;
+    color: #101010;
+    line-height: 1.4;
+}
+@media (max-width: 767px){
+    ._banner-caption {
+        left: 30%;
+        bottom: 10%;
+    font-size: 16px;
+    display: block;
+      background-color: #ffffffe0;
+    line-height: 1.4;
+}
+  }
+@media (max-width: 1400px){
+  ._banner-caption {
+      left: 30%;
+      bottom: 10%;
+    font-size: 16px;
+    display: block;
+      background-color: #ffffffe0;
+    line-height: 1.4;
+    }
+  }"""
+
+    final = "<style>\n" + banner_css + "\n" + override_css + "\n</style>"
+    print(f"Final CSS: {len(final)} chars\n")
+
+    # 5. Apply
+    print("Applying custom CSS overrides...")
+    result = gql(
+        'mutation UpdateCustomCssJs($content: String!) { updateCustomCssJs(content: $content) }',
+        {"content": final},
+    )
+
+    if "errors" in result:
+        print(f"ERROR: {json.dumps(result['errors'], indent=2)}")
+        return
+
+    print("Custom CSS applied successfully!\n")
+
+    # 6. Save for reference
+    out_path = os.path.join(DATA_DIR, "custom_css_overrides.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(final)
+    print(f"Saved to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
+
