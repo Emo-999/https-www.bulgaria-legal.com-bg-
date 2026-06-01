@@ -1,0 +1,15 @@
+# --- Secrets (contain the live CloudCart PAT token) ---
+access.md
+src/config.py
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- Build / scrape artifacts (regenerable) ---
+output/
+data/*.html
+data/*.png
+data/*.jpg
+data/*.jpeg
+data/*.webp
